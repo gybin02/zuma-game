@@ -1,13 +1,14 @@
 // 珠子链管理 — 移动、插入、消除、连锁
-import { Ball, BALL_DIAMETER, randomColorIndex } from './ball.js';
+import { Ball, BALL_DIAMETER, COLORS, randomColorIndex } from './ball.js';
 import { distance } from './utils.js';
+import { FEEL } from './feel.js';
 import log from './logger.js';
 
 export class Chain {
   constructor(path, level) {
     this.path = path;
     this.level = level;
-    this.balls = [];          // 所有球按 dist 排序
+    this.balls = [];
     this.speed = level.ballSpeed;
     this.spawnTimer = 0;
     this.spawnedCount = 0;
@@ -16,13 +17,17 @@ export class Chain {
     this.paused = false;
 
     // 消除动画相关
-    this.eliminating = [];    // 正在消除动画的球
-    this.merging = false;     // 是否正在回退接合
-    this.mergeGaps = [];      // {frontIdx, backStart, targetDist, currentDist}
+    this.eliminating = [];
+    this.merging = false;
+    this.mergeGaps = [];
 
     this.comboCount = 0;
     this.lastEliminateTime = 0;
-    this.lastEliminateResult = null; // {count, combo, x, y, color}
+    this.lastEliminateResult = null;
+
+    // 生成策略状态
+    this._lastSpawnColor = -1;
+    this._sameColorStreak = 0;
   }
 
   get allSpawned() {
@@ -53,6 +58,9 @@ export class Chain {
     // 更新消除动画
     this._updateEliminating(dt);
 
+    // 更新球动画（弹跳、危险区着色）
+    this._updateBallAnims(dt);
+
     // 更新球的屏幕坐标
     this._updatePositions();
   }
@@ -63,13 +71,37 @@ export class Chain {
     this.spawnTimer += dt;
     if (this.spawnTimer >= this.level.spawnInterval) {
       this.spawnTimer = 0;
-      const ball = new Ball(randomColorIndex(this.colorCount));
+      const colorIdx = this._pickSpawnColor();
+      const ball = new Ball(colorIdx);
       ball.dist = 0;
-      // 插入到链头
       this.balls.unshift(ball);
       this.spawnedCount++;
       log.debug('chain', `生成珠子 #${ball.id}`, { color: ball.colorIndex, spawned: this.spawnedCount, total: this.totalBalls });
     }
+  }
+
+  // 智能颜色选取：成段生成 + 偏向链上已有颜色
+  _pickSpawnColor() {
+    // 连续同色：有概率延续前一个颜色
+    if (this._lastSpawnColor >= 0 &&
+        this._sameColorStreak < FEEL.spawnMaxSameStreak &&
+        Math.random() < FEEL.spawnSameColorChance) {
+      this._sameColorStreak++;
+      return this._lastSpawnColor;
+    }
+
+    let color;
+    // 偏向链上已有颜色，增加可匹配性
+    if (this.balls.length > 0 && Math.random() < FEEL.spawnChainColorBias) {
+      const chainColors = [...new Set(this.balls.slice(0, 30).map(b => b.colorIndex))];
+      color = chainColors[Math.floor(Math.random() * chainColors.length)];
+    } else {
+      color = randomColorIndex(this.colorCount);
+    }
+
+    this._lastSpawnColor = color;
+    this._sameColorStreak = 1;
+    return color;
   }
 
   _moveBalls(dt) {
@@ -148,7 +180,7 @@ export class Chain {
   }
 
   _processMerges(dt) {
-    const mergeSpeed = this.speed * 4;
+    const mergeSpeed = this.speed * FEEL.mergeAccelMultiplier;
     const toRemove = [];
 
     for (let g = 0; g < this.mergeGaps.length; g++) {
@@ -203,10 +235,23 @@ export class Chain {
   _updateEliminating(dt) {
     for (let i = this.eliminating.length - 1; i >= 0; i--) {
       const ball = this.eliminating[i];
-      ball.scale -= dt * 4;
-      ball.opacity -= dt * 4;
+      ball.scale -= dt * FEEL.eliminateShrinkSpeed;
+      ball.opacity -= dt * FEEL.eliminateShrinkSpeed;
       if (ball.scale <= 0) {
         this.eliminating.splice(i, 1);
+      }
+    }
+  }
+
+  _updateBallAnims(dt) {
+    const dangerStart = this.path.totalLength * FEEL.dangerZoneThreshold;
+    for (const ball of this.balls) {
+      ball.updateAnim(dt);
+      // 危险区着色
+      if (ball.dist > dangerStart) {
+        ball.dangerTint = Math.min(1, (ball.dist - dangerStart) / (this.path.totalLength - dangerStart));
+      } else {
+        ball.dangerTint = 0;
       }
     }
   }
@@ -248,6 +293,7 @@ export class Chain {
     }
 
     this.balls.splice(insertIdx, 0, newBall);
+    newBall.bounceTimer = FEEL.insertBounceDuration; // 弹跳动画
     log.info('chain', `插入珠子 #${newBall.id}`, { insertIdx, dist: newBall.dist.toFixed(1), color: newBall.colorIndex, chainLen: this.balls.length });
 
     // 推开后方球
@@ -278,8 +324,11 @@ export class Chain {
     if (matchCount >= 3) {
       const matchIds = this.balls.slice(left, right + 1).map(b => b.id);
       log.info('chain', `消除 ${matchCount} 个珠子`, { color, matchIds, left, right, combo: this.comboCount + 1 });
-      // 记录后段起始位置
-      const backStart = left; // 删除后的 left 位置就是后段开始
+
+      // 消除前闪烁
+      for (let i = left; i <= right; i++) {
+        this.balls[i].flashTimer = FEEL.eliminateExpandDuration;
+      }
 
       // 消除
       const removed = this.balls.splice(left, matchCount);
